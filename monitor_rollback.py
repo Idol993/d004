@@ -310,29 +310,45 @@ def restore_previous_stable_version(release_id, operator='system'):
             raise ValueError(f"净值发布记录不存在: {release_id}")
 
         if not release.rollback_triggered:
-            raise ValueError("该发布未触发回退，无需恢复")
+            return {
+                'success': False,
+                'release_id': release_id,
+                'error_code': 'NO_ROLLBACK',
+                'message': f'[失败] 该发布(ID={release_id})未触发回退，无需执行版本恢复'
+            }
 
-        previous_version = release.previous_stable_version
-        if not previous_version:
-            raise ValueError("未找到上一稳定版本")
-
-        previous_release = db.query(NetValueRelease).filter(
+        stable_release = db.query(NetValueRelease).filter(
             NetValueRelease.fund_code == release.fund_code,
-            NetValueRelease.version == previous_version
-        ).first()
+            NetValueRelease.id != release_id,
+            NetValueRelease.status == 'PUBLISHED',
+            NetValueRelease.rollback_triggered == False
+        ).order_by(NetValueRelease.publish_time.desc() if NetValueRelease.publish_time != None else NetValueRelease.apply_time.desc()).first()
 
-        if not previous_release:
-            raise ValueError(f"上一稳定版本不存在: {previous_version}")
+        if not stable_release:
+            return {
+                'success': False,
+                'release_id': release_id,
+                'fund_code': release.fund_code,
+                'error_code': 'NO_STABLE_VERSION',
+                'message': f'[失败] 基金 {release.fund_code} 未找到已发布且未回退的上一稳定版本，无法执行恢复。请先完成一次成功的净值发布。'
+            }
 
-        release.monitor_active = True
+        recovery_time = datetime.now()
+        release.previous_stable_version = stable_release.version
+        stable_release.monitor_active = True
+
         write_audit_log(
             operator=operator,
             operation_type='VERSION_RESTORED',
             target_type='NetValueRelease',
             target_id=release_id,
             operation_details={
-                'restored_version': previous_version,
-                'restored_net_value': previous_release.net_value
+                'rollbacked_release_id': release_id,
+                'rollbacked_version': release.version,
+                'restored_release_id': stable_release.id,
+                'restored_version': stable_release.version,
+                'restored_net_value': stable_release.net_value,
+                'recovery_time': recovery_time.strftime('%Y-%m-%d %H:%M:%S')
             }
         )
 
@@ -340,11 +356,31 @@ def restore_previous_stable_version(release_id, operator='system'):
 
         return {
             'success': True,
-            'release_id': release_id,
-            'restored_version': previous_version,
-            'restored_net_value': previous_release.net_value,
+            'rollbacked_release': {
+                'id': release_id,
+                'release_no': release.release_no,
+                'version': release.version,
+                'net_value': release.net_value
+            },
+            'restored_stable_release': {
+                'id': stable_release.id,
+                'release_no': stable_release.release_no,
+                'version': stable_release.version,
+                'net_value': stable_release.net_value,
+                'publish_time': stable_release.publish_time.strftime('%Y-%m-%d %H:%M:%S') if stable_release.publish_time else None
+            },
+            'restored_version': stable_release.version,
+            'restored_net_value': stable_release.net_value,
+            'recovery_time': recovery_time.strftime('%Y-%m-%d %H:%M:%S'),
             'monitor_restarted': True,
-            'message': f'已恢复上一监管备案稳定版本 {previous_version}，监控已重启'
+            'message': (
+                f'[成功] 已恢复上一监管备案稳定版本\n'
+                f'  稳定版本号: {stable_release.version}\n'
+                f'  稳定净值:   {stable_release.net_value}\n'
+                f'  发布时间:   {stable_release.publish_time.strftime("%Y-%m-%d %H:%M:%S") if stable_release.publish_time else "N/A"}\n'
+                f'  恢复时间:   {recovery_time.strftime("%Y-%m-%d %H:%M:%S")}\n'
+                f'  监控状态:   已激活（稳定版本ID={stable_release.id}）'
+            )
         }
     except Exception as e:
         db.rollback()

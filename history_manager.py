@@ -22,23 +22,45 @@ STATUS_MAP = {
 
 
 def query_release_history(fund_code=None, start_date=None, end_date=None,
+                          publish_start_date=None, publish_end_date=None,
                           net_value_date=None, version=None, status=None,
-                          page=1, page_size=50):
+                          page=1, page_size=50, date_filter_type='publish'):
     db = SessionLocal()
     try:
-        query = db.query(NetValueRelease).order_by(NetValueRelease.apply_time.desc())
+        query = db.query(NetValueRelease).order_by(
+            NetValueRelease.publish_time.desc().nullslast() if date_filter_type == 'publish' else NetValueRelease.apply_time.desc()
+        )
 
         if fund_code:
             query = query.filter(NetValueRelease.fund_code == fund_code)
-        if start_date:
-            if isinstance(start_date, str):
-                start_date = datetime.strptime(start_date, '%Y-%m-%d')
-            query = query.filter(NetValueRelease.apply_time >= start_date)
-        if end_date:
-            if isinstance(end_date, str):
-                end_date = datetime.strptime(end_date, '%Y-%m-%d')
-            end_date = end_date.replace(hour=23, minute=59, second=59)
-            query = query.filter(NetValueRelease.apply_time <= end_date)
+        if date_filter_type == 'apply':
+            if start_date:
+                if isinstance(start_date, str):
+                    start_date = datetime.strptime(start_date, '%Y-%m-%d')
+                query = query.filter(NetValueRelease.apply_time >= start_date)
+            if end_date:
+                if isinstance(end_date, str):
+                    end_date = datetime.strptime(end_date, '%Y-%m-%d')
+                end_date = end_date.replace(hour=23, minute=59, second=59)
+                query = query.filter(NetValueRelease.apply_time <= end_date)
+        else:
+            if publish_start_date or start_date:
+                actual_start = publish_start_date if publish_start_date else start_date
+                if isinstance(actual_start, str):
+                    actual_start = datetime.strptime(actual_start, '%Y-%m-%d')
+                query = query.filter(
+                    (NetValueRelease.publish_time >= actual_start) |
+                    (NetValueRelease.publish_time == None)
+                )
+            if publish_end_date or end_date:
+                actual_end = publish_end_date if publish_end_date else end_date
+                if isinstance(actual_end, str):
+                    actual_end = datetime.strptime(actual_end, '%Y-%m-%d')
+                actual_end = actual_end.replace(hour=23, minute=59, second=59)
+                query = query.filter(
+                    (NetValueRelease.publish_time <= actual_end) |
+                    (NetValueRelease.publish_time == None)
+                )
         if net_value_date:
             if isinstance(net_value_date, str):
                 net_value_date = datetime.strptime(net_value_date, '%Y-%m-%d')
@@ -85,6 +107,7 @@ def query_release_history(fund_code=None, start_date=None, end_date=None,
                 'status_code': release.status,
                 'applicant': release.applicant,
                 'apply_time': release.apply_time.strftime('%Y-%m-%d %H:%M:%S'),
+                'publish_time': release.publish_time.strftime('%Y-%m-%d %H:%M:%S') if release.publish_time else None,
                 'pre_check_passed': release.pre_check_passed,
                 'approval_progress': f'{approval_count}/{total_approvals}' if total_approvals > 0 else '未开始',
                 'approval_passed': release.approval_passed,
@@ -102,6 +125,7 @@ def query_release_history(fund_code=None, start_date=None, end_date=None,
             'page': page,
             'page_size': page_size,
             'total_pages': (total + page_size - 1) // page_size,
+            'date_filter_type': date_filter_type,
             'data': results
         }
     finally:
@@ -201,7 +225,7 @@ def export_release_history(query_params=None, export_format='xlsx', operator='sy
     export_columns = [
         'release_no', 'fund_code', 'fund_name', 'net_value_date',
         'net_value', 'accumulated_net_value', 'daily_growth_rate',
-        'version', 'risk_level', 'status', 'applicant', 'apply_time',
+        'version', 'risk_level', 'status', 'applicant', 'apply_time', 'publish_time',
         'pre_check_passed', 'approval_progress', 'approval_passed',
         'push_status', 'rollback_triggered', 'rollback_reason', 'rollback_time'
     ]
@@ -210,7 +234,7 @@ def export_release_history(query_params=None, export_format='xlsx', operator='sy
     df_export.columns = [
         '发布编号', '基金代码', '基金名称', '净值日期',
         '单位净值', '累计净值', '日增长率(%)',
-        '版本号', '风险级别', '状态', '申请人', '申请时间',
+        '版本号', '风险级别', '状态', '申请人', '申请时间', '发布时间',
         '前置检查通过', '审批进度', '审批通过',
         '推送状态', '是否回退', '回退原因', '回退时间'
     ]

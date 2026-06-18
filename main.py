@@ -207,10 +207,11 @@ def demo_history_query():
         start_date=(datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d'),
         end_date=datetime.now().strftime('%Y-%m-%d'),
         page=1,
-        page_size=10
+        page_size=10,
+        date_filter_type='publish'
     )
 
-    print(f"\n共找到 {query_result['total']} 条记录，当前第 {query_result['page']}/{query_result['total_pages']} 页")
+    print(f"\n共找到 {query_result['total']} 条记录，当前第 {query_result['page']}/{query_result['total_pages']} 页（按发布时间筛选）")
 
     if query_result['data']:
         table_data = []
@@ -221,19 +222,22 @@ def demo_history_query():
                 item['fund_name'],
                 item['net_value_date'],
                 item['net_value'],
+                item['version'],
                 item['risk_level'],
                 item['status'],
-                item['apply_time']
+                item['apply_time'],
+                item.get('publish_time') or '未发布'
             ])
 
-        headers = ['发布编号', '基金代码', '基金名称', '净值日期', '单位净值', '风险级别', '状态', '申请时间']
+        headers = ['发布编号', '基金代码', '基金名称', '净值日期', '单位净值', '版本号', '风险级别', '状态', '申请时间', '发布时间']
         print(tabulate(table_data, headers=headers, tablefmt='simple', showindex=True))
 
-    print(f"\n5.2 批量导出查询结果为Excel")
+    print(f"\n5.2 批量导出查询结果为Excel（包含申请时间+发布时间两列）")
     export_result = export_release_history(
         query_params={
             'start_date': (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d'),
-            'end_date': datetime.now().strftime('%Y-%m-%d')
+            'end_date': datetime.now().strftime('%Y-%m-%d'),
+            'date_filter_type': 'publish'
         },
         export_format='xlsx',
         operator="user_export"

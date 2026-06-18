@@ -35,6 +35,7 @@ class NetValueRelease(Base):
     status = Column(String(30), default='PENDING', index=True)
     applicant = Column(String(50), nullable=False)
     apply_time = Column(DateTime, default=datetime.now)
+    publish_time = Column(DateTime, index=True)
     pre_check_passed = Column(Boolean, default=False)
     pre_check_details = Column(Text)
     current_approval_step = Column(Integer, default=0)
@@ -196,7 +197,25 @@ class NotificationRecord(Base):
 
 
 def init_db():
+    from sqlalchemy import inspect, text
     Base.metadata.create_all(bind=engine)
+
+    inspector = inspect(engine)
+    with engine.connect() as conn:
+        columns = [col['name'] for col in inspector.get_columns('net_value_releases')]
+        if 'publish_time' not in columns:
+            conn.execute(text("ALTER TABLE net_value_releases ADD COLUMN publish_time DATETIME"))
+            conn.commit()
+            print("数据库迁移: 新增 publish_time 列")
+
+        idx_names = [idx['name'] for idx in inspector.get_indexes('net_value_releases')]
+        if 'ix_net_value_releases_publish_time' not in idx_names:
+            try:
+                conn.execute(text("CREATE INDEX ix_net_value_releases_publish_time ON net_value_releases (publish_time)"))
+                conn.commit()
+            except Exception:
+                pass
+
     print("数据库初始化完成")
 
 

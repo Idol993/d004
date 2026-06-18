@@ -142,6 +142,7 @@ def push_to_personal(release_id, operator='system'):
         release.push_status = 'COMPLETED'
         release.status = 'PUBLISHED'
         release.monitor_active = True
+        release.publish_time = datetime.now()
         db.commit()
 
         return {

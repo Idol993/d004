@@ -28,7 +28,7 @@ RISK_LEVELS = {
 APPROVAL_FLOW = {
     'NORMAL': ['fund_accountant', 'compliance', 'investment_manager'],
     'URGENT': ['fund_accountant', 'compliance', 'investment_manager'],
-    'REGULATORY': ['compliance', 'investment_manager', 'chief_risk_officer']
+    'REGULATORY': ['fund_accountant', 'compliance', 'investment_manager']
 }
 
 INVESTOR_GRAYSCALE = {
