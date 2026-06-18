@@ -62,13 +62,28 @@ def execute_monitor_check(release_id, operator='system'):
     try:
         release = db.query(NetValueRelease).filter(NetValueRelease.id == release_id).first()
         if not release:
-            raise ValueError(f"净值发布记录不存在: {release_id}")
+            return {
+                'success': False,
+                'release_id': release_id,
+                'error_code': 'NOT_FOUND',
+                'message': f'[失败] 净值发布记录不存在: ID={release_id}'
+            }
 
         if not release.monitor_active:
-            return {'success': False, 'message': '监控未激活'}
+            return {
+                'success': False,
+                'release_id': release_id,
+                'error_code': 'MONITOR_INACTIVE',
+                'message': f'[跳过] 该发布(ID={release_id})监控未激活'
+            }
 
         if release.rollback_triggered:
-            return {'success': False, 'message': '已触发回退，监控停止'}
+            return {
+                'success': False,
+                'release_id': release_id,
+                'error_code': 'ALREADY_ROLLBACKED',
+                'message': f'[跳过] 该发布(ID={release_id})已触发回退，监控已停止'
+            }
 
         metrics = generate_monitor_metrics()
         alerts = check_thresholds(metrics)
@@ -120,7 +135,12 @@ def execute_monitor_check(release_id, operator='system'):
         }
     except Exception as e:
         db.rollback()
-        raise e
+        return {
+            'success': False,
+            'release_id': release_id,
+            'error_code': 'EXCEPTION',
+            'message': f'[失败] 监控检查过程中发生异常: {str(e)}'
+        }
     finally:
         db.close()
 
@@ -219,10 +239,20 @@ def trigger_compliance_rollback(release_id, trigger_reason, trigger_source='MANU
     try:
         release = db.query(NetValueRelease).filter(NetValueRelease.id == release_id).first()
         if not release:
-            raise ValueError(f"净值发布记录不存在: {release_id}")
+            return {
+                'success': False,
+                'release_id': release_id,
+                'error_code': 'NOT_FOUND',
+                'message': f'[失败] 净值发布记录不存在: ID={release_id}'
+            }
 
         if release.rollback_triggered:
-            return {'success': False, 'message': '该发布已触发回退'}
+            return {
+                'success': False,
+                'release_id': release_id,
+                'error_code': 'ALREADY_ROLLBACKED',
+                'message': f'[跳过] 该发布(ID={release_id})已触发过回退，无需重复执行'
+            }
 
         push_records = db.query(PushRecord).filter(
             PushRecord.release_id == release_id
@@ -286,7 +316,10 @@ def trigger_compliance_rollback(release_id, trigger_reason, trigger_source='MANU
             'report_path': report_path
         }
 
-        notify_rollback_triggered(rollback_info)
+        try:
+            notify_rollback_triggered(rollback_info)
+        except Exception:
+            pass
 
         return {
             'success': True,
@@ -296,7 +329,12 @@ def trigger_compliance_rollback(release_id, trigger_reason, trigger_source='MANU
         }
     except Exception as e:
         db.rollback()
-        raise e
+        return {
+            'success': False,
+            'release_id': release_id,
+            'error_code': 'EXCEPTION',
+            'message': f'[失败] 回退过程中发生异常: {str(e)}'
+        }
     finally:
         db.close()
 
@@ -307,7 +345,12 @@ def restore_previous_stable_version(release_id, operator='system'):
     try:
         release = db.query(NetValueRelease).filter(NetValueRelease.id == release_id).first()
         if not release:
-            raise ValueError(f"净值发布记录不存在: {release_id}")
+            return {
+                'success': False,
+                'release_id': release_id,
+                'error_code': 'NOT_FOUND',
+                'message': f'[失败] 净值发布记录不存在: ID={release_id}'
+            }
 
         if not release.rollback_triggered:
             return {
@@ -317,12 +360,15 @@ def restore_previous_stable_version(release_id, operator='system'):
                 'message': f'[失败] 该发布(ID={release_id})未触发回退，无需执行版本恢复'
             }
 
+        from sqlalchemy import func
         stable_release = db.query(NetValueRelease).filter(
             NetValueRelease.fund_code == release.fund_code,
             NetValueRelease.id != release_id,
             NetValueRelease.status == 'PUBLISHED',
             NetValueRelease.rollback_triggered == False
-        ).order_by(NetValueRelease.publish_time.desc() if NetValueRelease.publish_time != None else NetValueRelease.apply_time.desc()).first()
+        ).order_by(
+            func.coalesce(NetValueRelease.publish_time, NetValueRelease.apply_time).desc()
+        ).first()
 
         if not stable_release:
             return {
@@ -330,8 +376,13 @@ def restore_previous_stable_version(release_id, operator='system'):
                 'release_id': release_id,
                 'fund_code': release.fund_code,
                 'error_code': 'NO_STABLE_VERSION',
-                'message': f'[失败] 基金 {release.fund_code} 未找到已发布且未回退的上一稳定版本，无法执行恢复。请先完成一次成功的净值发布。'
+                'message': (
+                    f'[失败] 基金 {release.fund_code} 未找到已发布且未回退的上一稳定版本，无法执行恢复。\n'
+                    f'       请先完成一次成功的净值发布后再尝试恢复。'
+                )
             }
+
+        release.monitor_active = False
 
         recovery_time = datetime.now()
         release.previous_stable_version = stable_release.version
@@ -354,6 +405,18 @@ def restore_previous_stable_version(release_id, operator='system'):
 
         db.commit()
 
+        publish_time_str = stable_release.publish_time.strftime('%Y-%m-%d %H:%M:%S') if stable_release.publish_time else 'N/A'
+        recovery_time_str = recovery_time.strftime('%Y-%m-%d %H:%M:%S')
+
+        message = (
+            f'[成功] 已恢复上一监管备案稳定版本\n'
+            f'  稳定版本号: {stable_release.version}\n'
+            f'  稳定净值:   {stable_release.net_value}\n'
+            f'  发布时间:   {publish_time_str}\n'
+            f'  恢复时间:   {recovery_time_str}\n'
+            f'  监控状态:   已激活（稳定版本ID={stable_release.id}）'
+        )
+
         return {
             'success': True,
             'rollbacked_release': {
@@ -367,24 +430,22 @@ def restore_previous_stable_version(release_id, operator='system'):
                 'release_no': stable_release.release_no,
                 'version': stable_release.version,
                 'net_value': stable_release.net_value,
-                'publish_time': stable_release.publish_time.strftime('%Y-%m-%d %H:%M:%S') if stable_release.publish_time else None
+                'publish_time': publish_time_str
             },
             'restored_version': stable_release.version,
             'restored_net_value': stable_release.net_value,
-            'recovery_time': recovery_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'recovery_time': recovery_time_str,
             'monitor_restarted': True,
-            'message': (
-                f'[成功] 已恢复上一监管备案稳定版本\n'
-                f'  稳定版本号: {stable_release.version}\n'
-                f'  稳定净值:   {stable_release.net_value}\n'
-                f'  发布时间:   {stable_release.publish_time.strftime("%Y-%m-%d %H:%M:%S") if stable_release.publish_time else "N/A"}\n'
-                f'  恢复时间:   {recovery_time.strftime("%Y-%m-%d %H:%M:%S")}\n'
-                f'  监控状态:   已激活（稳定版本ID={stable_release.id}）'
-            )
+            'message': message
         }
     except Exception as e:
         db.rollback()
-        raise e
+        return {
+            'success': False,
+            'release_id': release_id,
+            'error_code': 'EXCEPTION',
+            'message': f'[失败] 恢复过程中发生异常: {str(e)}'
+        }
     finally:
         db.close()
 

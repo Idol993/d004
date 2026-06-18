@@ -44,23 +44,18 @@ def query_release_history(fund_code=None, start_date=None, end_date=None,
                 end_date = end_date.replace(hour=23, minute=59, second=59)
                 query = query.filter(NetValueRelease.apply_time <= end_date)
         else:
+            query = query.filter(NetValueRelease.publish_time != None)
             if publish_start_date or start_date:
                 actual_start = publish_start_date if publish_start_date else start_date
                 if isinstance(actual_start, str):
                     actual_start = datetime.strptime(actual_start, '%Y-%m-%d')
-                query = query.filter(
-                    (NetValueRelease.publish_time >= actual_start) |
-                    (NetValueRelease.publish_time == None)
-                )
+                query = query.filter(NetValueRelease.publish_time >= actual_start)
             if publish_end_date or end_date:
                 actual_end = publish_end_date if publish_end_date else end_date
                 if isinstance(actual_end, str):
                     actual_end = datetime.strptime(actual_end, '%Y-%m-%d')
                 actual_end = actual_end.replace(hour=23, minute=59, second=59)
-                query = query.filter(
-                    (NetValueRelease.publish_time <= actual_end) |
-                    (NetValueRelease.publish_time == None)
-                )
+                query = query.filter(NetValueRelease.publish_time <= actual_end)
         if net_value_date:
             if isinstance(net_value_date, str):
                 net_value_date = datetime.strptime(net_value_date, '%Y-%m-%d')
