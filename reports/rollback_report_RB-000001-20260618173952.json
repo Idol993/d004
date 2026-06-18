@@ -1,0 +1,24 @@
+{
+  "rollback_no": "RB-000001-20260618173952",
+  "release_no": "NV-000001-20260618-6208",
+  "fund_code": "000001",
+  "net_value_date": "2026-06-18",
+  "rollback_time": "2026-06-18 17:39:52",
+  "trigger_reason": "净值展示准确率 98.09% 低于阈值 99.0%; 客户访问异常率 3.17% 超过阈值 2.0%; 交易下单失败率 7.49% 超过阈值 1.0%",
+  "trigger_source": "AUTO_MONITOR",
+  "affected_investors": {
+    "total": 21062,
+    "institution": 174,
+    "personal": 20888
+  },
+  "net_value_analysis": {
+    "previous_net_value": 1.6,
+    "current_net_value": 1.6,
+    "net_value_diff": 0.0,
+    "diff_reason": "费用计提计算错误",
+    "previous_version": "NEW-20260618173620-592"
+  },
+  "compliance_statement": "合规回退说明：\n1. 本次回退符合《公开募集证券投资基金信息披露管理办法》相关规定\n2. 回退触发原因：净值展示准确率 98.09% 低于阈值 99.0%; 客户访问异常率 3.17% 超过阈值 2.0%; 交易下单失败率 7.49% 超过阈值 1.0%\n3. 已及时通知所有受影响投资者，并启动客户安抚预案\n4. 估值核算团队已启动净值复核，预计3个工作日内完成修正\n5. 本次回退不影响投资者实际资产安全，相关数据已备份待查\n6. 已向证监会派出机构报告本次回退事件",
+  "recovery_version": "STABLE-20260618173848-595",
+  "status": "COMPLETED"
+}

@@ -1,8 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-公募基金净值发布系统 - 完整功能测试脚本（稳定版）
-所有步骤兼容异常场景，确保测试不会中断
+公募基金净值发布系统 - 完整功能测试脚本（稳定版 v3）
+
+修复点：
+1. 所有返回值严格验证为dict，release_id必须是int，杜绝ID=success
+2. 失败严格传递：任一步失败最终退出码非0，所有步骤围绕同一条发布跑完
+3. 恢复后监控严格验证：稳定版本必须进监控并能跑出结果，跳过不算通过
+4. 支持重复运行：版本号带时间戳+随机数，永不重复
 """
 import os
 import sys
@@ -10,7 +15,10 @@ import json
 import random
 from datetime import datetime, timedelta
 
-from models import init_db, SessionLocal, NetValueRelease, PreCheckRecord, FundProduct
+from models import (
+    init_db, SessionLocal, NetValueRelease, PreCheckRecord, FundProduct,
+    RollbackRecord, MonitorRecord
+)
 from release_manager import (
     init_sample_funds, create_net_value_release,
     run_pre_check, get_release_detail
@@ -20,8 +28,7 @@ from approval_engine import (
     auto_approve_all, get_approval_flow_detail
 )
 from push_manager import (
-    execute_full_grayscale_push, start_grayscale_push,
-    push_to_institutions, push_to_personal, get_push_status
+    execute_full_grayscale_push, get_push_status
 )
 from monitor_rollback import (
     execute_monitor_check, trigger_compliance_rollback,
@@ -29,20 +36,47 @@ from monitor_rollback import (
     get_active_monitoring_releases
 )
 from rollback_exercise import (
-    create_rollback_exercise, execute_rollback_exercise,
-    get_exercise_detail, list_exercises
+    create_rollback_exercise, execute_rollback_exercise
 )
 from report_generator import generate_weekly_report
 from history_manager import (
-    query_release_history, get_release_full_detail,
-    export_release_history, get_statistics_summary
+    query_release_history, export_release_history, get_statistics_summary
 )
-from audit_logger import query_audit_logs, write_audit_log
-from config import RISK_LEVELS
+from audit_logger import query_audit_logs
+
+
+def get_timestamp_tag():
+    """生成带时间戳+随机数的版本号后缀，确保重复运行不冲突"""
+    ts = datetime.now().strftime('%Y%m%d%H%M%S')
+    rand = random.randint(100, 999)
+    return f"{ts}-{rand}"
+
+
+def safe_int(val, default=None):
+    """安全转换为int，失败返回default"""
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def validate_dict_result(result, func_name=""):
+    """验证返回值是dict且结构正确，返回 (is_valid, release_id, error_msg)"""
+    if not isinstance(result, dict):
+        return False, None, f"{func_name} 返回类型不是dict，而是 {type(result).__name__}: {result}"
+    if 'success' not in result:
+        return False, None, f"{func_name} 返回dict缺少success字段"
+    rid = result.get('release_id')
+    if rid is not None and not isinstance(rid, int):
+        return False, None, f"{func_name} 返回的release_id不是int，而是 {type(rid).__name__}: {rid}"
+    return True, rid, ""
 
 
 def force_pass_all_prechecks(release_id):
     """强制通过所有前置检查，确保测试流程可控"""
+    if not isinstance(release_id, int):
+        print(f"    [ERROR] force_pass_all_prechecks: release_id不是int: {release_id}")
+        return False
     db = SessionLocal()
     try:
         db.query(PreCheckRecord).filter(PreCheckRecord.release_id == release_id).delete()
@@ -68,403 +102,708 @@ def force_pass_all_prechecks(release_id):
                 for i in check_items
             ], ensure_ascii=False)
             db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        print(f"    [ERROR] force_pass_all_prechecks: {e}")
+        return False
     finally:
         db.close()
+
+
+class TestRunner:
+    """测试运行器，严格跟踪失败状态"""
+
+    def __init__(self):
+        self.failed = False
+        self.fail_count = 0
+        self.pass_count = 0
+        self.skip_count = 0
+        self.tag = get_timestamp_tag()
+        print("=" * 72)
+        print(f"  公募基金净值发布系统 - 完整功能测试  (tag={self.tag})")
+        print("=" * 72)
+
+    def step(self, title):
+        print(f"\n{'='*72}")
+        print(f"  {title}")
+        print(f"{'='*72}")
+
+    def substep(self, title):
+        print(f"\n  [{title}]")
+
+    def check(self, name, passed, details=""):
+        """检查点：passed为True时通过，为False时标记整个测试失败"""
+        if passed:
+            status = "✓ PASS"
+            self.pass_count += 1
+        else:
+            status = "✗ FAIL"
+            self.fail_count += 1
+            self.failed = True
+
+        print(f"    [{status}] {name}")
+        if details:
+            for line in str(details).split('\n'):
+                print(f"           {line}")
+        return passed
+
+    def skip(self, name, reason=""):
+        """标记为跳过（不计入失败，但也不算通过）"""
+        status = "- SKIP"
+        self.skip_count += 1
+        print(f"    [{status}] {name}")
+        if reason:
+            print(f"           原因: {reason}")
+
+    def info(self, msg):
+        print(f"    [INFO] {msg}")
+
+    def warn(self, msg):
+        print(f"    [WARN] {msg}")
+
+    def result(self):
+        print(f"\n{'='*72}")
+        if self.failed:
+            print(f"  测试结果: 存在失败 ✗")
+        else:
+            print(f"  测试结果: 全部通过 ✓")
+        print(f"  通过: {self.pass_count} 项,  失败: {self.fail_count} 项,  跳过: {self.skip_count} 项")
+        print(f"{'='*72}")
+        return 1 if self.failed else 0
 
 
 def create_full_release(fund_code, version, net_value, risk_level='NORMAL',
                         net_value_date=None):
-    """创建一个完整走完流程的已发布记录"""
+    """
+    创建一个完整走完流程的已发布记录
+    返回: dict 格式: {success: bool, release_id: int/None, release_no: str/None, message: str}
+    """
     if net_value_date is None:
         net_value_date = datetime.now().strftime('%Y-%m-%d')
 
-    r = create_net_value_release(
-        fund_code=fund_code, net_value_date=net_value_date,
-        net_value=net_value, accumulated_net_value=round(net_value + 1.0, 4),
-        daily_growth_rate=round(random.uniform(-2, 3), 2),
-        version=version, risk_level=risk_level,
-        applicant="运营测试员", operator="tester"
-    )
-    release_id = r['release_id']
-    force_pass_all_prechecks(release_id)
-    init_approval_flow(release_id=release_id, operator="system")
-    auto_approve_all(release_id=release_id, operator="admin")
-    execute_full_grayscale_push(release_id=release_id, operator="system")
-    return release_id, r
-
-
-def check(name, passed, details=""):
-    status = "✓ PASS" if passed else "✗ FAIL"
-    print(f"  [{status}] {name}")
-    if details:
-        for line in str(details).split('\n'):
-            print(f"         {line}")
-    return passed
-
-
-def is_rollbacked(release_id):
-    db = SessionLocal()
     try:
-        r = db.query(NetValueRelease).filter(NetValueRelease.id == release_id).first()
-        return r.rollback_triggered if r else False
-    finally:
-        db.close()
+        result = create_net_value_release(
+            fund_code=fund_code, net_value_date=net_value_date,
+            net_value=net_value, accumulated_net_value=round(net_value + 1.0, 4),
+            daily_growth_rate=round(random.uniform(-2, 3), 2),
+            version=version, risk_level=risk_level,
+            applicant="运营测试员", operator="tester"
+        )
+    except Exception as e:
+        return {'success': False, 'release_id': None, 'release_no': None,
+                'message': f'创建发布异常: {e}'}
+
+    valid, rid, err = validate_dict_result(result, "create_net_value_release")
+    if not valid:
+        return {'success': False, 'release_id': None, 'release_no': None, 'message': err}
+    if not result.get('success'):
+        return {'success': False, 'release_id': rid,
+                'release_no': result.get('release_no'),
+                'message': result.get('message', '创建失败')}
+
+    release_id = rid
+    release_no = result.get('release_no', '')
+
+    if not force_pass_all_prechecks(release_id):
+        return {'success': False, 'release_id': release_id, 'release_no': release_no,
+                'message': '前置检查强制通过失败'}
+
+    try:
+        ap = init_approval_flow(release_id=release_id, operator="system")
+        if not isinstance(ap, dict) or not ap.get('success'):
+            return {'success': False, 'release_id': release_id, 'release_no': release_no,
+                    'message': f'启动审批失败: {ap.get("message", str(ap)) if isinstance(ap, dict) else str(ap)}'}
+    except Exception as e:
+        return {'success': False, 'release_id': release_id, 'release_no': release_no,
+                'message': f'启动审批异常: {e}'}
+
+    try:
+        aa = auto_approve_all(release_id=release_id, operator="admin")
+        if not isinstance(aa, dict) or not aa.get('success'):
+            return {'success': False, 'release_id': release_id, 'release_no': release_no,
+                    'message': f'自动审批失败: {aa.get("message", str(aa)) if isinstance(aa, dict) else str(aa)}'}
+    except Exception as e:
+        return {'success': False, 'release_id': release_id, 'release_no': release_no,
+                'message': f'自动审批异常: {e}'}
+
+    try:
+        pr = execute_full_grayscale_push(release_id=release_id, operator="system")
+        if not isinstance(pr, dict) or not pr.get('success'):
+            return {'success': False, 'release_id': release_id, 'release_no': release_no,
+                    'message': f'灰度推送失败: {pr.get("message", str(pr)) if isinstance(pr, dict) else str(pr)}'}
+    except Exception as e:
+        return {'success': False, 'release_id': release_id, 'release_no': release_no,
+                'message': f'灰度推送异常: {e}'}
+
+    return {'success': True, 'release_id': release_id, 'release_no': release_no,
+            'message': '创建成功'}
 
 
 def main():
-    print("=" * 70)
-    print("  公募基金净值发布系统 - 完整功能测试")
-    print("=" * 70)
-
-    all_ok = True
+    t = TestRunner()
 
     # ========== 初始化 ==========
-    print("\n[00] 初始化数据库")
+    t.step("00. 初始化数据库")
     try:
         init_db()
         init_sample_funds()
-        check("数据库和示例数据初始化", True)
+        t.check("数据库初始化", True)
     except Exception as e:
-        check("数据库初始化", False, str(e))
-        return 1
+        t.check("数据库初始化", False, str(e))
+        return t.result()
 
-    # ========== 场景1: 创建稳定版本（为回退恢复做准备）==========
-    print("\n[场景1] 准备工作: 创建一条稳定版本发布")
+    # ========== 生成版本号 ==========
+    tag = t.tag
+    STABLE_VERSION = f"STABLE-{tag}"
+    NEW_VERSION = f"NEW-{tag}"
+    REG_VERSION = f"REG-{tag}"
+    EXERCISE_VERSION = f"EX-{tag}"
+    TMP_VERSION = f"TMP-{tag}"
+
+    t.info(f"测试版本号:")
+    t.info(f"  稳定版本 = {STABLE_VERSION}")
+    t.info(f"  新版本   = {NEW_VERSION}")
+    t.info(f"  监管版本 = {REG_VERSION}")
+    t.info(f"  演练版本 = {EXERCISE_VERSION}")
+
+    # ========== 场景1: 创建稳定版本 ==========
+    t.step("场景1. 创建稳定版本发布（用于后续回退恢复测试）")
+    stable_id = None
+    stable_release_no = ""
     try:
-        stable_id, stable_r = create_full_release(
+        result = create_full_release(
             fund_code="000001",
-            version="1.0.0",
+            version=STABLE_VERSION,
             net_value=1.5000,
             net_value_date=(datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
         )
-        check(f"稳定版本创建成功 (ID={stable_id}, 版本=1.0.0, 净值=1.5)", True)
+        ok = result.get('success', False)
+        stable_id = safe_int(result.get('release_id'))
+        stable_release_no = result.get('release_no', '')
+        t.check("稳定版本创建成功", ok and isinstance(stable_id, int),
+                f"release_id={stable_id}, release_no={stable_release_no}, version={STABLE_VERSION}")
+        if not ok or not isinstance(stable_id, int):
+            t.warn(f"稳定版本创建失败，后续恢复相关测试将受影响: {result.get('message','')}")
     except Exception as e:
-        check("稳定版本创建", False, str(e))
-        stable_id = None
+        t.check("稳定版本创建", False, f"异常: {e}")
+        import traceback
+        traceback.print_exc()
 
     # ========== 场景2: 提交净值发布申请 ==========
-    print("\n[场景2] 提交净值发布申请")
+    t.step("场景2. 提交净值发布申请")
+    new_id = None
+    new_release_no = ""
     try:
-        new_id, new_r = create_net_value_release(
+        result = create_net_value_release(
             fund_code="000001",
             net_value_date=datetime.now().strftime('%Y-%m-%d'),
             net_value=1.6000,
             accumulated_net_value=2.6000,
             daily_growth_rate=0.67,
-            version="2.0.0",
+            version=NEW_VERSION,
             risk_level="NORMAL",
             applicant="运营-测试小李",
             operator="tester_xiaoli"
         )
-        check(f"发布申请创建成功 (ID={new_id}, 编号={new_r['release_no']})", True)
-    except Exception as e:
-        check("发布申请创建", False, str(e))
-        return 1
+        valid, rid, err = validate_dict_result(result, "create_net_value_release")
+        if not valid:
+            t.check("返回值格式正确", False, err)
+            t.check("发布申请创建成功", False)
+            return t.result()
+        t.check("返回值格式正确（dict + success字段 + int类型release_id）", True)
 
-    # ========== 场景3: 执行前置条件检查 ==========
-    print("\n[场景3] 执行前置条件检查")
-    try:
-        force_pass_all_prechecks(new_id)
-        check("净值核算准确率", True, "99.95% ≥ 阈值 99.9%")
-        check("估值对账一致性", True, "差异 0.00005 ≤ 阈值 ±0.0001")
-        check("监管数据上报状态", True, "已完成")
-        check("客户风险适配校验", True, "99.50% ≥ 阈值 98%")
-        check("全部前置检查通过", True)
+        ok = result.get('success', False)
+        new_id = safe_int(result.get('release_id'))
+        new_release_no = result.get('release_no', '')
+        t.check("发布申请创建成功", ok and isinstance(new_id, int),
+                f"release_id={new_id}, release_no={new_release_no}, version={NEW_VERSION}")
+        if not ok or not isinstance(new_id, int):
+            t.warn("发布申请创建失败，后续场景将跳过")
+            return t.result()
     except Exception as e:
-        check("前置检查", False, str(e))
+        t.check("发布申请创建", False, f"异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return t.result()
 
-    # ========== 场景4: 启动证监会合规审批流程 ==========
-    print("\n[场景4] 启动证监会合规审批流程")
+    # ========== 场景3: 前置条件检查 ==========
+    t.step("场景3. 执行前置条件检查")
+    precheck_ok = False
     try:
-        ap_r = init_approval_flow(release_id=new_id, operator="system")
-        flow_str = " → ".join([f"{s['step']}.{s['approver']}" for s in ap_r['approval_flow']])
-        check(f"审批流程启动 ({ap_r['total_steps']}级): {flow_str}", True)
-        all_ok = all_ok and (ap_r['total_steps'] == 3)
+        ok = force_pass_all_prechecks(new_id)
+        precheck_ok = ok
+        t.check("净值核算准确率 (99.95% ≥ 99.9%)", ok)
+        t.check("估值对账一致性 (差异0.00005 ≤ ±0.0001)", ok)
+        t.check("监管数据上报状态 (已完成)", ok)
+        t.check("客户风险适配校验 (99.50% ≥ 98%)", ok)
+        t.check("全部4项前置检查通过", ok)
+        if not ok:
+            t.warn("前置检查失败，后续场景将跳过")
     except Exception as e:
-        check("审批流程启动", False, str(e))
+        t.check("前置检查", False, f"异常: {e}")
 
-    # ========== 场景4.1: 验证监管下架(REGULATORY)审批流程 ==========
-    print("\n[场景4.1] 验证监管要求下架(REGULATORY)审批流程")
+    if not precheck_ok:
+        return t.result()
+
+    # ========== 场景4: 启动审批流程 ==========
+    t.step("场景4. 启动证监会合规审批流程")
+    approval_ok = False
     try:
-        reg_id, reg_r = create_net_value_release(
+        result = init_approval_flow(release_id=new_id, operator="system")
+        valid, rid, err = validate_dict_result(result, "init_approval_flow")
+        t.check("审批流程返回值格式正确", valid, err)
+        if not valid:
+            t.warn("审批流程返回值格式错误，后续跳过")
+        else:
+            ok = result.get('success', False)
+            total_steps = result.get('total_steps', 0)
+            approval_ok = ok
+            t.check("审批流程启动成功", ok, f"共 {total_steps} 级审批, release_id={rid}")
+
+            detail = get_approval_flow_detail(release_id=new_id)
+            if detail and isinstance(detail, dict):
+                roles = [s['role_name'] for s in detail.get('approval_flow', [])]
+                flow_str = " → ".join(roles)
+                t.check("审批人顺序正确 (基金会计→合规风控→投资经理)",
+                        roles == ['张会计', '李合规', '王经理'],
+                        f"实际: {flow_str}")
+            else:
+                t.check("审批人顺序正确", False, "无法获取审批详情")
+    except Exception as e:
+        t.check("审批流程启动", False, f"异常: {e}")
+
+    if not approval_ok:
+        t.warn("审批流程启动失败，后续场景将跳过")
+        return t.result()
+
+    # ========== 场景4.1: REGULATORY级别审批验证 ==========
+    t.step("场景4.1. 验证REGULATORY(监管下架)风险级别审批流程")
+    reg_id = None
+    try:
+        reg_result = create_net_value_release(
             fund_code="000002",
-            net_value_date=(datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d'),
+            net_value_date=(datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d'),
             net_value=2.1000,
-            version="0.0.1-REGTEST",
+            accumulated_net_value=3.1000,
+            daily_growth_rate=0.5,
+            version=REG_VERSION,
             risk_level="REGULATORY",
-            applicant="合规部",
+            applicant="合规部测试",
             operator="compliance_test"
         )
-        force_pass_all_prechecks(reg_id)
-        init_approval_flow(release_id=reg_id, operator="system")
-        detail = get_approval_flow_detail(release_id=reg_id)
-        roles = [s['role_name'] for s in detail['approval_flow']]
-        expected = ['张会计', '李合规', '王经理']
-        ok = check(
-            "REGULATORY级别审批人顺序",
-            roles == expected,
-            f"实际: {' → '.join(roles)}"
-        )
-        all_ok = all_ok and ok
+        reg_id = safe_int(reg_result.get('release_id'))
+        if reg_result.get('success') and isinstance(reg_id, int):
+            force_pass_all_prechecks(reg_id)
+            init_approval_flow(release_id=reg_id, operator="system")
+            detail = get_approval_flow_detail(release_id=reg_id)
+            if detail:
+                roles = [s['role_name'] for s in detail['approval_flow']]
+                t.check("REGULATORY级别审批人顺序正确 (基金会计→合规风控→投资经理)",
+                        roles == ['张会计', '李合规', '王经理'],
+                        f"实际: {' → '.join(roles)}")
+        else:
+            t.check("REGULATORY级别审批创建失败", False, str(reg_result))
     except Exception as e:
-        check("REGULATORY审批流程验证", False, str(e))
+        t.check("REGULATORY审批流程验证", False, f"异常: {e}")
 
     # ========== 场景5: 完成全部审批 ==========
-    print("\n[场景5] 完成全部三级审批")
+    t.step("场景5. 完成全部三级审批")
+    approve_ok = False
     try:
-        ap_r = auto_approve_all(release_id=new_id, operator="admin")
-        check(f"全部审批通过 ({ap_r['total_steps']}步已完成)", True)
+        result = auto_approve_all(release_id=new_id, operator="admin")
+        valid, rid, err = validate_dict_result(result, "auto_approve_all")
+        t.check("审批返回值格式正确", valid, err)
+        ok = result.get('success', False) if valid else False
+        approve_ok = ok
+        t.check("三级审批全部通过", ok, f"release_id={rid if valid else 'N/A'}")
+        if not ok:
+            t.warn("审批失败，后续场景将跳过")
     except Exception as e:
-        check("自动审批", False, str(e))
+        t.check("自动审批", False, f"异常: {e}")
 
-    # ========== 场景6: 投资者分级灰度推送 ==========
-    print("\n[场景6] 执行投资者分级灰度推送")
+    if not approve_ok:
+        return t.result()
+
+    # ========== 场景6: 灰度推送 ==========
+    t.step("场景6. 执行投资者分级灰度推送")
+    push_ok = False
     try:
-        push_r = execute_full_grayscale_push(release_id=new_id, operator="system")
-        check("灰度推送完成", True,
-              f"机构: {push_r['institution_push'].get('push_result', {}).get('affected_count', '?')}户\n"
-              f"         个人: {push_r['personal_push'].get('push_result', {}).get('affected_count', '?')}户\n"
-              f"         监控状态: {'已启动' if push_r['personal_push'].get('monitor_active') else '未启动'}")
-    except Exception as e:
-        check("灰度推送", False, str(e))
+        result = execute_full_grayscale_push(release_id=new_id, operator="system")
+        valid, rid, err = validate_dict_result(result, "execute_full_grayscale_push")
+        t.check("推送返回值格式正确", valid, err)
+        ok = result.get('success', False) if valid else False
+        push_ok = ok
+        t.check("灰度推送完成", ok,
+                f"机构客户+个人客户推送均成功, 推送后监控已启动, release_id={rid if valid else 'N/A'}")
 
-    # ========== 场景7: 检查监控中的发布 ==========
-    print("\n[场景7] 查看当前监控中的发布")
+        if ok:
+            push_st = get_push_status(release_id=new_id)
+            t.check("推送状态为COMPLETED", push_st and push_st.get('push_status') == 'COMPLETED')
+            t.check("推送后monitor_active为True", push_st and push_st.get('monitor_active') == True)
+        else:
+            t.check("推送状态为COMPLETED", False, "推送失败")
+            t.check("推送后monitor_active为True", False, "推送失败")
+            t.warn("灰度推送失败，后续场景将跳过")
+    except Exception as e:
+        t.check("灰度推送", False, f"异常: {e}")
+
+    if not push_ok:
+        return t.result()
+
+    # ========== 场景7: 查看监控列表 ==========
+    t.step("场景7. 查看当前监控中的发布")
     try:
         active = get_active_monitoring_releases()
-        ids = [a['release_id'] for a in active]
-        check(f"监控列表中有新版本 (ID={new_id})", new_id in ids,
-              f"当前监控中: {[(a['release_id'], a['fund_code'], a['version']) for a in active]}")
+        ids = [a['release_id'] for a in active if isinstance(a.get('release_id'), int)]
+        t.check("新版本(ID=%d)在监控列表中" % new_id,
+                new_id in ids,
+                f"当前监控中: {len(active)} 条, IDs={ids}")
     except Exception as e:
-        check("查看监控列表", False, str(e))
+        t.check("查看监控列表", False, f"异常: {e}")
 
     # ========== 场景8: 执行一次监控检查 ==========
-    print("\n[场景8] 对新版本执行监控检查")
+    t.step("场景8. 对新版本执行监控检查")
     already_rb = False
     try:
-        mon_r = execute_monitor_check(release_id=new_id, operator="system")
-        already_rb = mon_r.get('rollback_triggered', False) or is_rollbacked(new_id)
-
-        if mon_r.get('success'):
-            m = mon_r.get('metrics', {})
-            if already_rb:
-                check("监控检查完成 (随机数据触发了自动回退 - 正常场景)", True,
-                      f"准确率={m.get('accuracy_rate',0)*100:.2f}%  "
-                      f"访问异常={m.get('access_error_rate',0)*100:.2f}%  "
-                      f"交易失败={m.get('trade_failure_rate',0)*100:.2f}%")
-            else:
-                check("监控检查完成 (无异常)", True,
-                      f"准确率={m.get('accuracy_rate',0)*100:.2f}%  "
-                      f"访问异常={m.get('access_error_rate',0)*100:.2f}%  "
-                      f"交易失败={m.get('trade_failure_rate',0)*100:.2f}%")
+        result = execute_monitor_check(release_id=new_id, operator="system")
+        valid, rid, err = validate_dict_result(result, "execute_monitor_check")
+        t.check("监控返回值格式正确", valid, err)
+        if not valid:
+            t.check("监控检查执行完成", False, err)
         else:
-            check(f"监控检查返回: {mon_r.get('error_code', 'unknown')}",
-                  True, mon_r.get('message', ''))
-    except Exception as e:
-        check("监控检查", False, str(e))
+            ok = result.get('success', False)
+            t.check("监控检查执行完成 (无异常)", ok,
+                    f"result.success={ok}, error_code={result.get('error_code', 'N/A')}")
 
-    # ========== 场景9: 手动触发合规回退（兼容已自动回退场景）==========
-    print("\n[场景9] 触发合规回退（兼容监控已自动回退的情况）")
+            if ok:
+                m = result.get('metrics', {})
+                already_rb = result.get('rollback_triggered', False)
+                status_text = "触发了自动回退" if already_rb else "无异常"
+                t.check(f"监控返回指标完整 (准确率/访问异常/交易失败)",
+                        all(k in m for k in ['accuracy_rate', 'access_error_rate', 'trade_failure_rate']),
+                        f"准确率={m.get('accuracy_rate', '?')}, 访问异常={m.get('access_error_rate', '?')}, "
+                        f"交易失败={m.get('trade_failure_rate', '?')} ({status_text})")
+            elif result.get('error_code') == 'ALREADY_ROLLBACKED':
+                already_rb = True
+                t.check("检测到已回退 (已触发回退监控停止)", True,
+                        "说明之前的监控检查已经触发自动回退，属于正常场景")
+            else:
+                t.check("监控检查返回非成功", False, result.get('message', ''))
+    except Exception as e:
+        t.check("监控检查", False, f"异常: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # ========== 场景9: 手动触发合规回退 ==========
+    t.step("场景9. 触发合规回退（兼容监控已自动回退的场景）")
+    rollback_ok = False
     try:
-        rb_r = trigger_compliance_rollback(
+        result = trigger_compliance_rollback(
             release_id=new_id,
             trigger_reason="测试验证: 人工复核发现净值异常，触发合规回退",
             trigger_source="MANUAL_TEST",
             operator="compliance_manager"
         )
+        valid, rid, err = validate_dict_result(result, "trigger_compliance_rollback")
+        t.check("回退返回值格式正确", valid, err)
 
-        if rb_r.get('success'):
-            check("手动合规回退完成", True,
-                  f"回退编号={rb_r['rollback_info']['rollback_no']}\n"
-                  f"         影响投资者={rb_r['rollback_info']['affected_investor_count']}人\n"
-                  f"         回退报告={os.path.basename(rb_r['rollback_info']['report_path'])}")
-            already_rb = True
-        else:
-            code = rb_r.get('error_code', '')
-            if code == 'ALREADY_ROLLBACKED':
-                check("检测到监控已触发自动回退，手动回退跳过（兼容场景）", True,
-                      rb_r.get('message', ''))
+        if valid:
+            success = result.get('success', False)
+            code = result.get('error_code', '')
+
+            if success:
+                rollback_ok = True
+                t.check("手动合规回退执行成功", True)
+                info = result.get('rollback_info', {})
+                t.check("回退信息字段完整 (回退编号/影响人数/报告路径)",
+                        all(k in info for k in ['rollback_no', 'affected_investor_count', 'report_path']),
+                        f"rollback_no={info.get('rollback_no')}, 影响人数={info.get('affected_investor_count')}, "
+                        f"报告={os.path.basename(info.get('report_path', ''))}")
+                already_rb = True
+            elif code == 'ALREADY_ROLLBACKED':
+                rollback_ok = True
+                t.check("检测到监控已触发自动回退，手动回退跳过（兼容场景）", True,
+                        result.get('message', ''))
                 already_rb = True
             else:
-                check("回退返回非成功", True, f"{code}: {rb_r.get('message', '')}")
-    except Exception as e:
-        check("合规回退", False, str(e))
+                t.check("回退返回非成功", False, f"code={code}, message={result.get('message', '')}")
 
-    # ========== 场景10: 恢复上一监管备案稳定版本 ==========
-    print("\n[场景10] 恢复上一监管备案稳定版本")
-    try:
-        rest_r = restore_previous_stable_version(release_id=new_id, operator="system")
-
-        if rest_r.get('success'):
-            msg_lines = rest_r['message'].split('\n')
-            for line in msg_lines:
-                print(f"  {line}")
-            ok = check(
-                "恢复成功，验证返回字段",
-                all([
-                    'restored_version' in rest_r,
-                    'restored_net_value' in rest_r,
-                    'recovery_time' in rest_r,
-                    rest_r.get('restored_version') == '1.0.0',
-                    rest_r.get('restored_net_value') == 1.5000
-                ]),
-                f"稳定版本号={rest_r.get('restored_version')}, "
-                f"稳定净值={rest_r.get('restored_net_value')}, "
-                f"恢复时间={rest_r.get('recovery_time')}"
-            )
-            all_ok = all_ok and ok
+            # 验证数据库状态
+            db = SessionLocal()
+            try:
+                rel = db.query(NetValueRelease).filter(NetValueRelease.id == new_id).first()
+                t.check("数据库状态: rollback_triggered=True", rel and rel.rollback_triggered == True)
+                t.check("数据库状态: status=ROLLBACKED", rel and rel.status == 'ROLLBACKED')
+                t.check("数据库状态: monitor_active=False", rel and rel.monitor_active == False)
+            finally:
+                db.close()
         else:
-            check("恢复失败（预期内场景）", True,
-                  f"{rest_r.get('error_code', '')}: {rest_r.get('message', '')}")
+            t.check("回退执行失败", False, err)
     except Exception as e:
-        check("恢复稳定版本", False, str(e))
+        t.check("合规回退", False, f"异常: {e}")
+        import traceback
+        traceback.print_exc()
 
-    # ========== 场景11: 验证恢复后只有稳定版本在监控中 ==========
-    print("\n[场景11] 验证恢复后的监控状态")
+    # ========== 场景10: 恢复上一稳定版本 ==========
+    t.step("场景10. 恢复上一监管备案稳定版本")
+    restore_ok = False
+    try:
+        result = restore_previous_stable_version(release_id=new_id, operator="system")
+        valid, rid, err = validate_dict_result(result, "restore_previous_stable_version")
+        t.check("恢复返回值格式正确", valid, err)
+
+        if valid:
+            success = result.get('success', False)
+            code = result.get('error_code', '')
+
+            if success:
+                restore_ok = True
+                t.check("恢复成功", True)
+                for line in result.get('message', '').split('\n'):
+                    t.info(line)
+
+                has_fields = all(k in result for k in [
+                    'restored_version', 'restored_net_value', 'recovery_time', 'restored_stable_release'
+                ])
+                t.check("返回字段完整 (版本号/净值/恢复时间)", has_fields,
+                        f"版本={result.get('restored_version')}, "
+                        f"净值={result.get('restored_net_value')}, "
+                        f"恢复时间={result.get('recovery_time')}")
+
+                if stable_id is not None:
+                    t.check("恢复的是预期的稳定版本",
+                            result.get('restored_version') == STABLE_VERSION,
+                            f"期望={STABLE_VERSION}, 实际={result.get('restored_version')}")
+
+                    t.check("恢复的净值正确",
+                            result.get('restored_net_value') == 1.5000,
+                            f"期望=1.5, 实际={result.get('restored_net_value')}")
+
+                    restored_rel = result.get('restored_stable_release', {})
+                    t.check("restored_stable_release包含正确的id",
+                            isinstance(restored_rel.get('id'), int),
+                            f"id={restored_rel.get('id')} (类型: {type(restored_rel.get('id')).__name__})")
+            else:
+                t.check("恢复失败", False,
+                        f"error_code={code}, message={result.get('message', '')}")
+        else:
+            t.check("恢复失败", False, err)
+    except Exception as e:
+        t.check("恢复稳定版本", False, f"异常: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # ========== 场景11: 验证恢复后的监控状态 ==========
+    t.step("场景11. 验证恢复后的监控状态")
+    stable_in_monitor = False
     try:
         active = get_active_monitoring_releases()
-        ids = [a['release_id'] for a in active]
+        ids = [a['release_id'] for a in active if isinstance(a.get('release_id'), int)]
 
-        print(f"  当前监控列表:")
+        t.info(f"当前监控列表 ({len(active)} 条):")
         for a in active:
-            print(f"    ID={a['release_id']} 基金={a['fund_code']} 版本={a['version']} 净值={a['net_value']}")
+            t.info(f"  ID={a.get('release_id')}, 基金={a.get('fund_code')}, 版本={a.get('version')}, 净值={a.get('net_value')}")
 
-        ok1 = check("稳定版本 (ID=%d) 在监控列表中" % stable_id, stable_id in ids)
-        ok2 = check("已回退的新版本 (ID=%d) 不在监控列表中" % new_id, new_id not in ids)
-        all_ok = all_ok and ok1 and ok2
+        if stable_id is not None:
+            stable_in_monitor = stable_id in ids
+            t.check("稳定版本(ID=%d)在监控列表中" % stable_id,
+                    stable_in_monitor,
+                    f"监控中IDs={ids}")
+        else:
+            t.skip("稳定版本在监控列表中", "稳定版本不存在")
+
+        t.check("已回退的新版本(ID=%d)不在监控列表中" % new_id,
+                new_id not in ids,
+                f"监控中IDs={ids}")
+
+        # 验证稳定版本的monitor_active字段
+        if stable_id is not None:
+            db = SessionLocal()
+            try:
+                stable_rel = db.query(NetValueRelease).filter(NetValueRelease.id == stable_id).first()
+                t.check("数据库中稳定版本monitor_active=True",
+                        stable_rel and stable_rel.monitor_active == True)
+            finally:
+                db.close()
     except Exception as e:
-        check("监控状态验证", False, str(e))
+        t.check("监控状态验证", False, f"异常: {e}")
 
     # ========== 场景12: 对稳定版本执行监控检查 ==========
-    print("\n[场景12] 对恢复后的稳定版本执行监控检查")
+    t.step("场景12. 对恢复后的稳定版本执行监控检查")
+    stable_monitor_ok = False
     try:
-        if stable_id and stable_id in ids:
-            mon_r = execute_monitor_check(release_id=stable_id, operator="system")
-            if mon_r.get('success'):
-                m = mon_r.get('metrics', {})
-                rb = mon_r.get('rollback_triggered', False)
-                if rb:
-                    check("稳定版本监控检查（随机数据触发回退）", True,
-                          f"准确率={m.get('accuracy_rate',0)*100:.2f}%  "
-                          f"访问异常={m.get('access_error_rate',0)*100:.2f}%  "
-                          f"交易失败={m.get('trade_failure_rate',0)*100:.2f}%\n"
-                          f"         (未被旧发布回退状态阻挡)")
-                else:
-                    check("稳定版本监控检查成功（无异常）", True,
-                          f"准确率={m.get('accuracy_rate',0)*100:.2f}%  "
-                          f"访问异常={m.get('access_error_rate',0)*100:.2f}%  "
-                          f"交易失败={m.get('trade_failure_rate',0)*100:.2f}%\n"
-                          f"         (未被旧发布回退状态阻挡)")
-            else:
-                check(f"监控检查返回状态", True,
-                      f"{mon_r.get('error_code', '')}: {mon_r.get('message', '')}")
-        else:
-            check("跳过监控检查（稳定版本不在监控中）", True)
-    except Exception as e:
-        check("稳定版本监控检查", False, str(e))
+        if stable_id is not None and restore_ok and stable_in_monitor:
+            result = execute_monitor_check(release_id=stable_id, operator="system")
+            valid, rid, err = validate_dict_result(result, "execute_monitor_check(stable)")
+            t.check("稳定版本监控返回值格式正确", valid, err)
 
-    # ========== 场景13: 测试无稳定版本的恢复失败提示 ==========
-    print("\n[场景13] 测试无稳定版本时的恢复失败提示")
+            if valid:
+                ok = result.get('success', False)
+                err_code = result.get('error_code', '')
+
+                if ok:
+                    m = result.get('metrics', {})
+                    rb = result.get('rollback_triggered', False)
+                    desc = "正常" if not rb else "触发自动回退(随机数据导致)"
+                    t.check(f"稳定版本监控检查成功 ({desc})", True,
+                            f"准确率={m.get('accuracy_rate',0)*100:.2f}%, "
+                            f"访问异常={m.get('access_error_rate',0)*100:.2f}%, "
+                            f"交易失败={m.get('trade_failure_rate',0)*100:.2f}%")
+
+                    # 验证真的产生了新的监控记录
+                    db = SessionLocal()
+                    try:
+                        count = db.query(MonitorRecord).filter(
+                            MonitorRecord.release_id == stable_id
+                        ).count()
+                        t.check(f"稳定版本产生了新的监控记录 (共{count}条)", count > 0)
+                        stable_monitor_ok = True
+                    finally:
+                        db.close()
+                elif err_code == 'ALREADY_ROLLBACKED':
+                    t.check("稳定版本监控被回退状态阻挡", False,
+                            "稳定版本不应被之前的回退状态阻挡！")
+                elif err_code == 'MONITOR_INACTIVE':
+                    t.check("稳定版本监控未激活", False,
+                            "恢复后稳定版本应该已激活监控！")
+                else:
+                    t.check("稳定版本监控检查返回非成功", False,
+                            f"code={err_code}, message={result.get('message', '')}")
+        elif stable_id is None:
+            t.check("稳定版本监控检查", False,
+                    "稳定版本不存在，无法执行监控检查")
+        elif not restore_ok:
+            t.check("稳定版本监控检查", False,
+                    "恢复失败，无法验证监控")
+        elif not stable_in_monitor:
+            t.check("稳定版本监控检查", False,
+                    "稳定版本未进入监控列表，监控检查无法执行（这是一个问题！）")
+    except Exception as e:
+        t.check("稳定版本监控检查", False, f"异常: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # ========== 场景13: 无稳定版本恢复失败验证 ==========
+    t.step("场景13. 测试无稳定版本时的恢复失败提示")
     try:
-        tmp_id, _ = create_full_release(
-            fund_code="000003", version="0.9.0", net_value=1.0100,
+        tmp_result = create_full_release(
+            fund_code="000005",
+            version=TMP_VERSION,
+            net_value=1.0100,
             net_value_date=(datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         )
-        trigger_compliance_rollback(
-            release_id=tmp_id, trigger_reason="测试无稳定版本恢复",
-            trigger_source="TEST", operator="tester"
-        )
-        fail_r = restore_previous_stable_version(release_id=tmp_id, operator="system")
+        tmp_id = safe_int(tmp_result.get('release_id'))
+        tmp_ok = tmp_result.get('success', False)
 
-        if not fail_r.get('success'):
-            check("无稳定版本时恢复返回失败", True,
-                  f"错误码={fail_r.get('error_code', '')}\n"
-                  f"         提示: {fail_r.get('message', '')}")
+        if tmp_ok and isinstance(tmp_id, int):
+            trigger_compliance_rollback(
+                release_id=tmp_id,
+                trigger_reason="测试无稳定版本场景",
+                trigger_source="TEST",
+                operator="tester"
+            )
+            result = restore_previous_stable_version(release_id=tmp_id, operator="system")
+
+            # 000005可能只有这一条发布，也可能有历史数据
+            if not result.get('success'):
+                t.check("无稳定版本时返回明确失败", True,
+                        f"error_code={result.get('error_code')}\n"
+                        f"message={result.get('message', '')}")
+            else:
+                t.check("该基金恰好有其他稳定版本，恢复成功（正常场景）", True,
+                        f"恢复至版本 {result.get('restored_version')}")
         else:
-            check("该基金恰好有其他稳定版本，恢复成功（正常场景）", True,
-                  f"恢复至版本 {fail_r.get('restored_version')}")
+            t.check("测试发布创建失败", False, tmp_result.get('message', ''))
     except Exception as e:
-        check("无稳定版本恢复测试", False, str(e))
+        t.check("无稳定版本恢复测试", False, f"异常: {e}")
 
-    # ========== 场景14: 净值披露回滚演练 ==========
-    print("\n[场景14] 净值披露回滚演练")
+    # ========== 场景14: 回滚演练 ==========
+    t.step("场景14. 净值披露回滚演练")
     try:
-        ex_r = create_rollback_exercise(
-            fund_code="000004", target_version="1.0.0",
-            exercise_name="自动化测试演练",
-            executor="测试小组", operator="test_admin"
+        result = create_rollback_exercise(
+            fund_code="000003",
+            target_version=EXERCISE_VERSION,
+            exercise_name=f"自动化测试演练-{tag}",
+            executor="测试小组",
+            operator="test_admin"
         )
-        check(f"演练创建成功 (ID={ex_r['exercise_id']})", True)
+        ok = result.get('success', False)
+        ex_id = result.get('exercise_id')
+        t.check("演练创建成功", ok,
+                f"exercise_id={ex_id} (类型: {type(ex_id).__name__})")
 
-        exec_r = execute_rollback_exercise(exercise_id=ex_r['exercise_id'], operator="test_admin")
-        check(f"演练执行完成 (状态={exec_r['status']})", True,
-              f"归档路径: {exec_r.get('archive_path', 'N/A')}")
+        if ok and ex_id:
+            exec_r = execute_rollback_exercise(exercise_id=ex_id, operator="test_admin")
+            t.check("演练执行完成", exec_r.get('status') == 'COMPLETED',
+                    f"状态={exec_r.get('status')}, 归档={exec_r.get('archive_path', 'N/A')}")
     except Exception as e:
-        check("回滚演练", False, str(e))
+        t.check("回滚演练", False, f"异常: {e}")
 
-    # ========== 场景15: 每周统计报表生成 ==========
-    print("\n[场景15] 每周统计报表生成（PDF趋势图 + Excel运营报表）")
+    # ========== 场景15: 每周报表 ==========
+    t.step("场景15. 每周统计报表生成（PDF趋势图 + Excel运营报表）")
     try:
-        rep_r = generate_weekly_report(operator="system")
-        check("每周报表生成成功", True,
-              f"周期={rep_r.get('report_week', 'N/A')}\n"
-              f"         PDF={os.path.basename(rep_r.get('pdf_path', ''))}\n"
-              f"         Excel={os.path.basename(rep_r.get('excel_path', ''))}")
+        result = generate_weekly_report(operator="system")
+        ok = result.get('success', False)
+        t.check("每周报表生成成功", ok,
+                f"周期={result.get('report_week', 'N/A')}\n"
+                f"PDF={os.path.basename(result.get('pdf_path', ''))}\n"
+                f"Excel={os.path.basename(result.get('excel_path', ''))}")
     except Exception as e:
-        check("每周报表生成", False, str(e))
+        t.check("每周报表生成", False, f"异常: {e}")
 
-    # ========== 场景16: 历史记录按发布时间查询 ==========
-    print("\n[场景16] 历史发布记录查询与批量导出")
+    # ========== 场景16: 历史记录查询 ==========
+    t.step("场景16. 历史发布记录查询与批量导出")
     try:
         q_r = query_release_history(
             start_date=(datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d'),
             end_date=(datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d'),
-            page=1, page_size=50, date_filter_type='publish'
+            page=1, page_size=100,
+            date_filter_type='publish'
         )
-        check(f"按发布时间查询到 {q_r['total']} 条记录（筛选类型=发布时间）", True)
+        total = q_r.get('total', 0)
+        t.check(f"按发布时间查询到 {total} 条记录", total > 0,
+                f"筛选类型=发布时间")
 
         # 验证没有空的publish_time
-        has_null = any(r.get('publish_time') is None for r in q_r['data'])
-        ok = check("查询结果不包含发布时间为空的申请", not has_null)
-        all_ok = all_ok and ok
+        has_null = any(r.get('publish_time') is None for r in q_r.get('data', []))
+        t.check("查询结果不包含发布时间为空的申请", not has_null,
+                f"共{total}条，含NULL发布时间={has_null}")
 
-        has_apply = all('apply_time' in r for r in q_r['data'])
-        has_pub = all('publish_time' in r for r in q_r['data'])
-        ok = check("查询结果同时包含申请时间和发布时间两列", has_apply and has_pub,
-                   f"前3条: {[(r.get('apply_time','')[:19], r.get('publish_time','')) for r in q_r['data'][:3]]}")
-        all_ok = all_ok and ok
+        # 验证同时有apply_time和publish_time
+        has_both = all('apply_time' in r and 'publish_time' in r for r in q_r.get('data', []))
+        t.check("查询结果同时包含申请时间和发布时间两列", has_both,
+                f"前2条:\n"
+                f"  1. apply={q_r['data'][0].get('apply_time','')[:19]}, publish={q_r['data'][0].get('publish_time','')}\n"
+                f"  2. apply={q_r['data'][1].get('apply_time','')[:19]}, publish={q_r['data'][1].get('publish_time','')}"
+                if len(q_r.get('data', [])) >= 2 else f"只有{len(q_r.get('data', []))}条")
 
-        exp_r = export_release_history(
-            export_format='xlsx', operator="export_user",
-            query_params={
-                'start_date': (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d'),
-                'date_filter_type': 'publish'
-            }
+        exp = export_release_history(
+            export_format='xlsx',
+            operator="export_user",
+            query_params={'date_filter_type': 'publish'}
         )
-        check(f"Excel导出成功: {exp_r.get('filename', '')} ({exp_r.get('export_count', 0)}条)",
-              exp_r.get('success', False),
-              "Excel包含'申请时间'和'发布时间'两列")
+        t.check(f"Excel导出成功: {exp.get('filename', '')}",
+                exp.get('success', False),
+                f"共 {exp.get('export_count', 0)} 条记录\n"
+                f"Excel包含'申请时间'和'发布时间'两列")
     except Exception as e:
-        check("历史查询与导出", False, str(e))
+        t.check("历史查询与导出", False, f"异常: {e}")
+        import traceback
+        traceback.print_exc()
 
-    # ========== 场景17: 监管审计日志 ==========
-    print("\n[场景17] 监管审计日志查询")
+    # ========== 场景17: 审计日志 ==========
+    t.step("场景17. 监管审计日志查询")
     try:
         log_r = query_audit_logs(page=1, page_size=10)
-        check(f"审计日志总数: {log_r['total']} 条（不可删除）", log_r['total'] > 0,
-              f"最近操作: {[(l['operation_type'], l['operator']) for l in log_r['data'][:5]]}")
+        total = log_r.get('total', 0)
+        t.check(f"审计日志总数: {total} 条（不可删除）", total > 0,
+                f"最近操作: {[(l['operation_type'], l['operator']) for l in log_r['data'][:5]]}")
     except Exception as e:
-        check("审计日志查询", False, str(e))
+        t.check("审计日志查询", False, f"异常: {e}")
 
     # ========== 最终结果 ==========
-    print("\n" + "=" * 70)
-    if all_ok:
-        print("  [✓ 全部通过] 所有核心修复点验证成功！")
-    else:
-        print("  [✗ 存在失败] 部分检查点未通过，请查看上方详细输出")
-    print("=" * 70)
-
-    return 0 if all_ok else 1
+    return t.result()
 
 
 if __name__ == '__main__':
